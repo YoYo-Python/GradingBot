@@ -64,12 +64,17 @@ Output strictly valid JSON (no markdown fences, no ```json):
 """
 
 def clean_json(text: str) -> str:
-    text = re.sub(r"^```json\s*", "", text.strip(), flags=re.MULTILINE)
-    text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
-    match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+    text = text.strip()
+    # Strip markdown code block fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    
+    # Extract the outermost JSON object bounds
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
 
 def sanitize_text(text: str) -> str:
     replacements = {
@@ -140,10 +145,42 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
                 ]
             }],
             "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.1,
-                "maxOutputTokens": 8192
-            }
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "pages": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "page_index": {"type": "INTEGER"},
+                                "page_score": {"type": "NUMBER"},
+                                "max_page_marks": {"type": "NUMBER"},
+                                "annotations": {
+                                    "type": "ARRAY",
+                                    "items": {
+                                        "type": "OBJECT",
+                                        "properties": {
+                                            "y_position_percent": {"type": "NUMBER"},
+                                            "question_ref": {"type": "STRING"},
+                                            "awarded_marks": {"type": "NUMBER"},
+                                            "is_correct": {"type": "BOOLEAN"},
+                                            "comment": {"type": "STRING"}
+                                        },
+                                        "required": ["y_position_percent", "question_ref", "awarded_marks", "is_correct", "comment"]
+                                    }
+                                }
+                            },
+                            "required": ["page_index", "page_score", "annotations"]
+                        }
+                    }
+                },
+                "required": ["pages"]
+            },
+            "temperature": 0.1,
+            "maxOutputTokens": 8192
+        }
         }
         # Clean model and key strings to prevent whitespace/newline issues
         clean_model = str(MODEL).strip()
@@ -156,11 +193,21 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
             gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
             if gen_res.status_code == 200:
                 raw_text = gen_res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                parsed_data = json.loads(clean_json(raw_text))
-                pages_list = parsed_data.get("pages", [])
-                results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
-                success = True
-                break
+                try:
+                    cleaned = clean_json(raw_text)
+                    parsed_data = json.loads(cleaned)
+                    pages_list = parsed_data.get("pages", [])
+                    results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
+                    success = True
+                    break
+                except json.JSONDecodeError as err:
+                    if attempt < 3:
+                        time.sleep(attempt * 2)
+                        continue
+                    st.error(f"Failed to parse model JSON: {err}")
+                    with st.expander("Show raw model output for debugging"):
+                        st.code(raw_text)
+                    st.stop()
             elif gen_res.status_code in (503, 429):
                 time.sleep(attempt * 3)
             else:
@@ -170,7 +217,6 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
         if not success:
             st.error("Failed to grade submission after retries. Please submit again.")
             st.stop()
-
         # Dynamic Scale & Annotation
         total_exam_score = 0
         is_1_indexed = (0 not in results) and (1 in results)
