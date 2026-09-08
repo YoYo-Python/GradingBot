@@ -4,14 +4,14 @@ import requests
 import json
 import re
 import os
-import tempfile
 
 # -------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION & SECRETS
 # -------------------------------------------------------------
-API_KEY = "AQ.Ab8RN6JcLAADySNQqxyJ2KYgXiKIivvOYCPzmMYU55RWsPRD_A"
+API_KEY = st.secrets.get("GEMINI_API_KEY", "AQ.Ab8RN6JcLAADySNQqxyJ2KYgXiKIivvOYCPzmMYU55RWsPRD_A")
 MS_FILE_URI = "https://generativelanguage.googleapis.com/v1beta/files/c8opgi09eyjm"
 MODEL = "gemini-3.6-flash"
+
 GENERATE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
 UPLOAD_URL = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={API_KEY}"
 
@@ -77,6 +77,9 @@ def sanitize_text(text: str) -> str:
         text = text.replace(k, v)
     return text.encode("latin-1", "replace").decode("latin-1")
 
+# -------------------------------------------------------------
+# UI INTERFACE
+# -------------------------------------------------------------
 st.set_page_config(page_title="Paper 6 Chemistry Grader", layout="centered")
 st.title("🧪 IGCSE Chemistry Paper 6 Grader")
 st.caption("Upload student exam scans to automatically annotate and calculate total marks.")
@@ -89,7 +92,7 @@ if uploaded_file and st.button("Start Grading", type="primary"):
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
 
-        # 1. Upload to Gemini File API
+        # 1. Resumable Upload to Gemini File API
         data_len = str(len(pdf_bytes))
         headers = {
             "X-Goog-Upload-Protocol": "resumable",
@@ -98,21 +101,21 @@ if uploaded_file and st.button("Start Grading", type="primary"):
             "X-Goog-Upload-Header-Content-Type": "application/pdf",
             "Content-Type": "application/json"
         }
-        
+
         init = requests.post(
-            upload_url,
+            UPLOAD_URL,
             headers=headers,
             json={"file": {"display_name": "student_paper_upload"}},
             timeout=(10, 30)
         )
-        
+
         if init.status_code != 200:
-            st.error(f"Failed to initiate PDF upload to Gemini API ({init.status_code}): {init.text}")
+            st.error(f"Failed to initiate PDF upload to Gemini ({init.status_code}): {init.text}")
             st.stop()
 
         session_url = init.headers.get("X-Goog-Upload-URL")
         if not session_url:
-            st.error(f"Google API did not return an upload session URL. Response: {init.text}")
+            st.error(f"Google did not provide an upload URL. Response: {init.text}")
             st.stop()
 
         upload_headers = {
@@ -120,19 +123,19 @@ if uploaded_file and st.button("Start Grading", type="primary"):
             "X-Goog-Upload-Offset": "0",
             "X-Goog-Upload-Command": "upload, finalize"
         }
-        
         res = requests.post(session_url, headers=upload_headers, data=pdf_bytes, timeout=(10, 60))
+
         if res.status_code != 200:
-            st.error(f"Failed to finalize PDF upload ({res.status_code}): {res.text}")
+            st.error(f"Failed to upload PDF data to Gemini ({res.status_code}): {res.text}")
             st.stop()
 
-        file_info = res.json().get("file")
-        if not file_info or "uri" not in file_info:
-            st.error(f"Invalid file response from Gemini API: {res.text}")
-            st.stop()
+        file_info = res.json().get("file", {})
+        student_uri = file_info.get("uri")
+        student_file_name = file_info.get("name")
 
-        student_uri = file_info["uri"]
-        student_file_name = file_info["name"]
+        if not student_uri:
+            st.error("Could not obtain student file URI from Google API response.")
+            st.stop()
 
         # 2. Query Gemini
         results = {}
@@ -157,11 +160,18 @@ if uploaded_file and st.button("Start Grading", type="primary"):
                 parsed_data = json.loads(clean_json(raw_text))
                 pages_list = parsed_data.get("pages", [])
                 results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
+            else:
+                st.error(f"Gemini API inference error ({gen_res.status_code}): {gen_res.text}")
+                st.stop()
+        except Exception as e:
+            st.error(f"Error parsing model response: {e}")
+            st.stop()
         finally:
-            try:
-                requests.delete(f"[https://generativelanguage.googleapis.com/v1beta/](https://generativelanguage.googleapis.com/v1beta/){student_file_name}?key={API_KEY}", timeout=10)
-            except Exception:
-                pass
+            if student_file_name:
+                try:
+                    requests.delete(f"[https://generativelanguage.googleapis.com/v1beta/](https://generativelanguage.googleapis.com/v1beta/){student_file_name}?key={API_KEY}", timeout=10)
+                except Exception:
+                    pass
 
         # 3. Dynamic Box Annotation
         total_exam_score = 0
@@ -181,7 +191,7 @@ if uploaded_file and st.button("Start Grading", type="primary"):
             max_marks = page_data.get("max_page_marks", "")
             total_exam_score += int(score) if str(score).isdigit() else 0
 
-            # Badge
+            # Score badge in top-right
             badge_w = 175.0 * scale
             badge_h = 28.0 * scale
             badge_margin = 12.0 * scale
