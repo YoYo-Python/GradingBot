@@ -183,12 +183,12 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
         }
         }
         # Clean model and key strings to prevent whitespace/newline issues
+        # Clean both model and API key strings to prevent whitespace/URL errors
         clean_model = str(MODEL).strip()
-        clean_api_key = str(API_KEY).strip()
+        clean_key = str(API_KEY).strip()
 
         target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_key}"
         
-        # --- INITIALIZE BEFORE LOOP ---
         results = {}
         success = False
 
