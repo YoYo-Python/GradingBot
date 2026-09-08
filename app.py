@@ -5,15 +5,17 @@ import json
 import re
 import base64
 import time
+import io
+import zipfile
 
 # -------------------------------------------------------------
 # CONFIGURATION & SECRETS
 # -------------------------------------------------------------
-API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-MODEL = "gemini-3.6-flash"  # or your preferred flash model
+API_KEY = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+MODEL = "gemini-3.6-flash"
 
 if not API_KEY:
-    API_KEY = st.sidebar.text_input("Enter Gemini API Key", type="password")
+    API_KEY = str(st.sidebar.text_input("Enter Gemini API Key", type="password")).strip()
     if not API_KEY:
         st.warning("Please configure your GEMINI_API_KEY in Streamlit Secrets or enter it in the sidebar.")
         st.stop()
@@ -24,6 +26,7 @@ Evaluate the complete student answer script against the official Cambridge Mark 
 "If an answer area is completely blank, award [0] and add a concise note: 'Unattempted' without shifting subsequent question alignment"
 "Ignore pre-existing red colored pen writing/ticks from previous checks and evaluate only the original blue or black student handwriting against the mark scheme"
 If you find the word doubt written in a question, award [0] and add a concise note explaining the question and the answer in the marking scheme without shifting subsequent question alignment.
+
 CORE INSTRUCTIONS:
 1. STRICT MARK SCHEME ADHERENCE:
    - Award marks ONLY when the student satisfies the specific marking points (M1, A1, B1, etc.).
@@ -36,40 +39,18 @@ CORE INSTRUCTIONS:
      * Second physical page = page_index 1
      * Page N = page_index N-1
    - Never assign marks from one physical page to a different page index.
+4. CRITICAL VERTICAL ALIGNMENT RULE:
+   - For 'y_position_percent', provide the EXACT vertical percentage (from 0 to 100, where 0 is the top edge and 100 is the bottom edge) corresponding to WHERE THE STUDENT WROTE THEIR ANSWER for that sub-question.
+   - DO NOT push annotations into the footer or generic coordinates. Align each box beside the dotted answer line or response region for that specific question.
 
 After you finish grading the exam, recheck again to make sure that there are no mistakes in checking paper 6 chemistry exam.
-
 Make sure you add up the marks correctly, don't skip questions and make sure the paper is graded correctly based on the marking scheme and don't forget that there is error carried forward (ECF) in this exam so if the student makes a mistake in readings in a table and plots these incorrect plots correctly on the graph he only loses for incorrect reading in the table once.
-
-OUTPUT FORMAT:
-Output strictly valid JSON (no markdown fences, no ```json):
-{
-  "pages": [
-    {
-      "page_index": 0,
-      "page_score": 6,
-      "max_page_marks": 6,
-      "annotations": [
-        {
-          "y_position_percent": 35,
-          "question_ref": "4(a)",
-          "awarded_marks": 1,
-          "is_correct": true,
-          "comment": "M1: Measured specific volume of water and recorded initial temp."
-        }
-      ]
-    }
-  ]
-}
 """
 
 def clean_json(text: str) -> str:
     text = text.strip()
-    # Strip markdown code block fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
-    
-    # Extract the outermost JSON object bounds
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -85,66 +66,20 @@ def sanitize_text(text: str) -> str:
         text = text.replace(k, v)
     return text.encode("latin-1", "replace").decode("latin-1")
 
-# -------------------------------------------------------------
-# UI SETUP & SESSION STATE
-# -------------------------------------------------------------
-st.set_page_config(page_title="IGCSE Paper 6 Batch Grader", layout="centered")
-st.title("🧪 IGCSE Chemistry Grader")
+def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
+    student_b64 = base64.b64encode(student_bytes).decode("utf-8")
+    doc = pymupdf.open(stream=student_bytes, filetype="pdf")
+    total_pages = len(doc)
 
-if "ms_base64" not in st.session_state:
-    st.session_state.ms_base64 = None
-if "ms_file_name" not in st.session_state:
-    st.session_state.ms_file_name = None
-
-# --- Step 1: Mark Scheme Upload ---
-st.subheader("1. Mark Scheme (Upload Once)")
-ms_upload = st.file_uploader("Upload Cambridge Mark Scheme (PDF)", type=["pdf"], key="ms_uploader")
-
-if ms_upload is not None:
-    st.session_state.ms_base64 = base64.b64encode(ms_upload.read()).decode("utf-8")
-    st.session_state.ms_file_name = ms_upload.name
-    st.success(f"Active Mark Scheme: **{st.session_state.ms_file_name}**")
-elif st.session_state.ms_base64 is not None:
-    st.info(f"Active Mark Scheme: **{st.session_state.ms_file_name}**")
-    if st.button("Change Mark Scheme"):
-        st.session_state.ms_base64 = None
-        st.session_state.ms_file_name = None
-        st.rerun()
-else:
-    st.warning("Please upload a Mark Scheme to begin grading.")
-    st.stop()
-
-# --- Step 2: Student Papers Upload ---
-st.divider()
-st.subheader("2. Student Submission")
-uploaded_student = st.file_uploader("Upload Student PDF", type=["pdf"], key="student_uploader")
-
-if uploaded_student and st.button("Grade Paper", type="primary"):
-    with st.spinner("Grading script against session Mark Scheme..."):
-        student_bytes = uploaded_student.read()
-        student_base64 = base64.b64encode(student_bytes).decode("utf-8")
-        doc = pymupdf.open(stream=student_bytes, filetype="pdf")
-        total_pages = len(doc)
-
-        payload = {
-            "contents": [{
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "application/pdf",
-                            "data": st.session_state.ms_base64
-                        }
-                    },
-                    {
-                        "inline_data": {
-                            "mime_type": "application/pdf",
-                            "data": student_base64
-                        }
-                    },
-                    {"text": GRADING_PROMPT}
-                ]
-            }],
-            "generationConfig": {
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "application/pdf", "data": ms_b64}},
+                {"inline_data": {"mime_type": "application/pdf", "data": student_b64}},
+                {"text": GRADING_PROMPT}
+            ]
+        }],
+        "generationConfig": {
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "OBJECT",
@@ -181,133 +116,221 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
             "temperature": 0.1,
             "maxOutputTokens": 8192
         }
-        }
-        # Clean model and key strings to prevent whitespace/newline issues
-        # Clean both model and API key strings to prevent whitespace/URL errors
-        clean_model = str(MODEL).strip()
-        clean_key = str(API_KEY).strip()
+    }
 
-        target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_key}"
-        
-        results = {}
-        success = False
+    clean_model = str(MODEL).strip()
+    clean_key = str(API_KEY).strip()
+    target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_key}"
 
-        for attempt in range(1, 4):
-            gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
-            if gen_res.status_code == 200:
-                raw_text = gen_res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                try:
-                    cleaned = clean_json(raw_text)
-                    parsed_data = json.loads(cleaned)
-                    pages_list = parsed_data.get("pages", [])
-                    results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
-                    success = True
-                    break
-                except json.JSONDecodeError as err:
-                    if attempt < 3:
-                        time.sleep(attempt * 2)
-                        continue
-                    st.error(f"Failed to parse model JSON: {err}")
-                    with st.expander("Show raw model output for debugging"):
-                        st.code(raw_text)
-                    st.stop()
-            elif gen_res.status_code in (503, 429):
-                time.sleep(attempt * 3)
-            else:
-                st.error(f"Inference error ({gen_res.status_code}): {gen_res.text}")
+    results = {}
+    success = False
+
+    for attempt in range(1, 4):
+        gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
+        if gen_res.status_code == 200:
+            raw_text = gen_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+            try:
+                parsed_data = json.loads(clean_json(raw_text))
+                pages_list = parsed_data.get("pages", [])
+                results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
+                success = True
                 break
+            except json.JSONDecodeError:
+                if attempt < 3:
+                    time.sleep(attempt * 2)
+                    continue
+                raise RuntimeError("Failed to decode model JSON output.")
+        elif gen_res.status_code in (503, 429):
+            time.sleep(attempt * 3)
+        else:
+            raise RuntimeError(f"API Call Failed ({gen_res.status_code}): {gen_res.text}")
 
-        if not success:
-            st.error("Failed to grade submission after retries. Please submit again.")
-            st.stop()
-        # Dynamic Scale & Annotation
-        total_exam_score = 0
-        is_1_indexed = (0 not in results) and (1 in results)
+    if not success:
+        raise RuntimeError("Inference unsuccessful after 3 attempts.")
 
-        for i in range(total_pages):
-            page = doc[i]
-            w = page.rect.width
-            h = page.rect.height
-            scale = max(1.0, w / 595.0)
+    total_exam_score = 0
+    is_1_indexed = (0 not in results) and (1 in results)
 
-            lookup_key = (i + 1) if is_1_indexed else i
-            page_data = results.get(lookup_key, {"page_score": 0, "annotations": []})
+    for i in range(total_pages):
+        page = doc[i]
+        w, h = page.rect.width, page.rect.height
+        scale = max(1.0, w / 595.0)
 
-            score = page_data.get("page_score", 0)
-            max_marks = page_data.get("max_page_marks", "")
-            total_exam_score += int(score) if str(score).isdigit() else 0
+        lookup_key = (i + 1) if is_1_indexed else i
+        page_data = results.get(lookup_key, {"page_score": 0, "annotations": []})
 
-            # Badge
-            badge_w = 175.0 * scale
-            badge_h = 28.0 * scale
-            badge_margin = 12.0 * scale
-            badge_rect = pymupdf.Rect(w - badge_w - badge_margin, badge_margin, w - badge_margin, badge_margin + badge_h)
-            page.draw_rect(badge_rect, color=(0.12, 0.45, 0.85), fill=(0.94, 0.97, 1.0), width=1.2 * scale)
-            page.insert_textbox(badge_rect, f"Page Score: {score}" + (f" / {max_marks}" if max_marks else ""), fontsize=10.5 * scale, fontname="helv", color=(0.10, 0.35, 0.75), align=pymupdf.TEXT_ALIGN_CENTER)
+        score = page_data.get("page_score", 0)
+        max_marks = page_data.get("max_page_marks", "")
+        total_exam_score += int(score) if str(score).isdigit() else 0
 
-            annotations = page_data.get("annotations", [])
-            def get_y_percent(ann):
-                if "y_position_percent" in ann:
-                    return float(ann["y_position_percent"])
-                if "box_2d" in ann and isinstance(ann["box_2d"], list) and len(ann["box_2d"]) == 4:
-                    return float(ann["box_2d"][0]) / 10.0
-                return 30.0
+        # Page Score Badge
+        badge_w = 175.0 * scale
+        badge_h = 28.0 * scale
+        badge_margin = 12.0 * scale
+        badge_rect = pymupdf.Rect(
+            w - badge_w - badge_margin,
+            badge_margin,
+            w - badge_margin,
+            badge_margin + badge_h
+        )
+        page.draw_rect(badge_rect, color=(0.12, 0.45, 0.85), fill=(0.94, 0.97, 1.0), width=1.2 * scale)
+        page.insert_textbox(
+            badge_rect,
+            f"Page Score: {score}" + (f" / {max_marks}" if max_marks else ""),
+            fontsize=10.5 * scale,
+            fontname="helv",
+            color=(0.10, 0.35, 0.75),
+            align=pymupdf.TEXT_ALIGN_CENTER
+        )
 
-            annotations.sort(key=get_y_percent)
+        annotations = page_data.get("annotations", [])
 
-            last_y_bottom = (badge_margin + badge_h) + (10.0 * scale)
-            margin_right = 14.0 * scale
-            card_width = max(185.0 * scale, w * 0.28)
-            x1 = w - margin_right
-            x0 = max(10.0 * scale, x1 - card_width)
-            base_font = 8.5 * scale
-            usable_text_width = (x1 - x0) - (12.0 * scale)
+        def get_y_percent(ann):
+            if "y_position_percent" in ann:
+                return float(ann["y_position_percent"])
+            if "box_2d" in ann and isinstance(ann["box_2d"], list) and len(ann["box_2d"]) == 4:
+                return float(ann["box_2d"][0]) / 10.0
+            return 30.0
 
-            for item in annotations:
-                is_correct = item.get("is_correct", False) or item.get("color") == "green" or "[1]" in item.get("comment", "")
-                q_ref = item.get("question_ref", "")
-                marks = item.get("awarded_marks", 1 if is_correct else 0)
-                comment = item.get("comment", item.get("text", "")).strip()
+        annotations.sort(key=get_y_percent)
 
-                prefix = f"[+{marks}]" if is_correct else f"[{marks}]"
-                tag = f"{q_ref} {prefix}".strip()
-                full_text = sanitize_text(f"{tag}: {comment}" if tag else comment)
+        margin_right = 10.0 * scale
+        card_width = max(200.0 * scale, w * 0.32)
+        x1 = w - margin_right
+        x0 = max(10.0 * scale, x1 - card_width)
+        base_font = 8.0 * scale
+        usable_text_width = (x1 - x0) - (10.0 * scale)
 
-                line_len = pymupdf.get_text_length(full_text, fontname="helv", fontsize=base_font)
-                est_lines = max(1, int(line_len // usable_text_width) + full_text.count('\n') + 1)
-                line_height = base_font * 1.3
-                card_height = (est_lines * line_height) + (10.0 * scale)
+        last_y_bottom = badge_margin + badge_h + (6.0 * scale)
 
-                target_y = (get_y_percent(item) / 100.0) * h
-                actual_y0 = max(target_y, last_y_bottom + (6.0 * scale))
-                actual_y1 = actual_y0 + card_height
+        for item in annotations:
+            is_correct = item.get("is_correct", False) or item.get("color") == "green" or "[1]" in item.get("comment", "")
+            q_ref = item.get("question_ref", "")
+            marks = item.get("awarded_marks", 1 if is_correct else 0)
+            comment = item.get("comment", item.get("text", "")).strip()
 
-                bottom_limit = h - (15.0 * scale)
-                if actual_y1 > bottom_limit:
-                    actual_y0 = max(last_y_bottom + (2.0 * scale), bottom_limit - card_height)
-                    actual_y1 = actual_y0 + card_height
+            prefix = f"[+{marks}]" if is_correct else f"[{marks}]"
+            tag = f"{q_ref} {prefix}".strip()
+            full_text = sanitize_text(f"{tag}: {comment}" if tag else comment)
 
-                rect = pymupdf.Rect(x0, actual_y0, x1, actual_y1)
-                color = (0.15, 0.55, 0.15) if is_correct else (0.85, 0.15, 0.15)
-                fill = (0.94, 0.98, 0.94) if is_correct else (1.0, 0.94, 0.94)
+            line_len = pymupdf.get_text_length(full_text, fontname="helv", fontsize=base_font)
+            est_lines = max(1, int(line_len // usable_text_width) + full_text.count('\n') + 1)
+            card_height = (est_lines * (base_font * 1.25)) + (8.0 * scale)
 
-                page.draw_rect(rect, color=color, fill=fill, width=1.0 * scale)
-                pad_x, pad_y = 5.0 * scale, 4.0 * scale
-                text_rect = pymupdf.Rect(rect.x0 + pad_x, rect.y0 + pad_y, rect.x1 - pad_x, rect.y1 - pad_y)
+            target_y = (get_y_percent(item) / 100.0) * h
 
-                rc = page.insert_textbox(text_rect, full_text, fontsize=base_font, fontname="helv", color=(0.08, 0.40, 0.08) if is_correct else (0.70, 0.05, 0.05), align=pymupdf.TEXT_ALIGN_LEFT)
-                if rc < 0:
-                    page.insert_textbox(text_rect, full_text, fontsize=base_font * 0.85, fontname="helv", color=(0.08, 0.40, 0.08) if is_correct else (0.70, 0.05, 0.05), align=pymupdf.TEXT_ALIGN_LEFT)
+            # Direct line alignment with collision nudge
+            if target_y < last_y_bottom:
+                actual_y0 = last_y_bottom + (3.0 * scale)
+            else:
+                actual_y0 = target_y
 
-                last_y_bottom = actual_y1
+            actual_y1 = actual_y0 + card_height
 
-        out_pdf_bytes = doc.write()
-        doc.close()
+            if actual_y1 > h - (10.0 * scale):
+                actual_y1 = h - (10.0 * scale)
+                actual_y0 = max(last_y_bottom, actual_y1 - card_height)
 
-    st.success(f"Grading Complete! Total Score: {total_exam_score} / 40")
+            rect = pymupdf.Rect(x0, actual_y0, x1, actual_y1)
+            stroke_color = (0.15, 0.55, 0.15) if is_correct else (0.85, 0.15, 0.15)
+            fill_color = (0.96, 1.0, 0.96) if is_correct else (1.0, 0.96, 0.96)
+            text_color = (0.05, 0.40, 0.05) if is_correct else (0.75, 0.05, 0.05)
+
+            page.draw_rect(rect, color=stroke_color, fill=fill_color, width=0.8 * scale)
+
+            pad_x = 4.0 * scale
+            pad_y = 3.0 * scale
+            text_rect = pymupdf.Rect(rect.x0 + pad_x, rect.y0 + pad_y, rect.x1 - pad_x, rect.y1 - pad_y)
+
+            rc = page.insert_textbox(
+                text_rect,
+                full_text,
+                fontsize=base_font,
+                fontname="helv",
+                color=text_color,
+                align=pymupdf.TEXT_ALIGN_LEFT
+            )
+            if rc < 0:
+                page.insert_textbox(
+                    text_rect,
+                    full_text,
+                    fontsize=base_font * 0.85,
+                    fontname="helv",
+                    color=text_color,
+                    align=pymupdf.TEXT_ALIGN_LEFT
+                )
+
+            last_y_bottom = actual_y1
+
+    out_bytes = doc.write()
+    doc.close()
+    return total_exam_score, out_bytes
+
+# -------------------------------------------------------------
+# APPLICATION UI
+# -------------------------------------------------------------
+st.set_page_config(page_title="IGCSE Paper 6 Batch Grader", layout="centered")
+st.title("🧪 IGCSE Chemistry Batch Grader")
+
+if "ms_base64" not in st.session_state:
+    st.session_state.ms_base64 = None
+if "ms_file_name" not in st.session_state:
+    st.session_state.ms_file_name = None
+
+# Step 1: Mark Scheme Upload
+st.subheader("1. Mark Scheme (Upload Once)")
+ms_upload = st.file_uploader("Upload Cambridge Mark Scheme (PDF)", type=["pdf"], key="ms_uploader")
+
+if ms_upload:
+    st.session_state.ms_base64 = base64.b64encode(ms_upload.read()).decode("utf-8")
+    st.session_state.ms_file_name = ms_upload.name
+    st.success(f"Active Mark Scheme: **{st.session_state.ms_file_name}**")
+elif st.session_state.ms_base64:
+    st.info(f"Active Mark Scheme: **{st.session_state.ms_file_name}**")
+    if st.button("Change Mark Scheme"):
+        st.session_state.ms_base64 = None
+        st.session_state.ms_file_name = None
+        st.rerun()
+else:
+    st.warning("Please upload a Mark Scheme first to begin.")
+    st.stop()
+
+# Step 2: Student Papers Upload
+st.divider()
+st.subheader("2. Student Submissions")
+uploaded_students = st.file_uploader(
+    "Select student answer papers (PDF)",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+
+if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)", type="primary"):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    zip_buffer = io.BytesIO()
+    summary_scores = []
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for idx, student_file in enumerate(uploaded_students):
+            status_text.text(f"Grading {student_file.name} ({idx + 1}/{len(uploaded_students)})...")
+            try:
+                score, graded_bytes = grade_single_pdf(student_file.read(), st.session_state.ms_base64)
+                out_name = f"Graded_{student_file.name}"
+                zip_file.writestr(out_name, graded_bytes)
+                summary_scores.append({"Student File": student_file.name, "Score": f"{score}/40", "Status": "Success"})
+            except Exception as e:
+                summary_scores.append({"Student File": student_file.name, "Score": "N/A", "Status": f"Failed: {e}"})
+
+            progress_bar.progress((idx + 1) / len(uploaded_students))
+
+    status_text.text("Batch grading complete!")
+    st.table(summary_scores)
+
+    zip_buffer.seek(0)
     st.download_button(
-        label="📥 Download Annotated PDF",
-        data=out_pdf_bytes,
-        file_name=f"graded_{uploaded_student.name}",
-        mime="application/pdf"
+        label="📦 Download All Graded Papers (.ZIP)",
+        data=zip_buffer,
+        file_name="Graded_Submissions.zip",
+        mime="application/zip"
     )
