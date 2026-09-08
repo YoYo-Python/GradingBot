@@ -66,6 +66,29 @@ def sanitize_text(text: str) -> str:
         text = text.replace(k, v)
     return text.encode("latin-1", "replace").decode("latin-1")
 
+def extract_and_parse_json(raw_text: str) -> dict:
+    """Safely extracts and parses JSON even if wrapped in markdown fences or trailing thoughts."""
+    text = raw_text.strip()
+    
+    # 1. Strip markdown fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
+    
+    # 2. Find the outermost JSON object bounds
+    start_idx = text.find("{")
+    end_idx = text.rfind("}")
+    
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        candidate = text[start_idx:end_idx + 1]
+    else:
+        candidate = text
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # Fallback: clean trailing commas before closing braces/brackets
+        fixed = re.sub(r",\s*([\]}])", r"\1", candidate)
+        return json.loads(fixed)
 def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
     student_b64 = base64.b64encode(student_bytes).decode("utf-8")
     doc = pymupdf.open(stream=student_bytes, filetype="pdf")
@@ -81,38 +104,6 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
         }],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "pages": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "page_index": {"type": "INTEGER"},
-                                "page_score": {"type": "NUMBER"},
-                                "max_page_marks": {"type": "NUMBER"},
-                                "annotations": {
-                                    "type": "ARRAY",
-                                    "items": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "y_position_percent": {"type": "NUMBER"},
-                                            "question_ref": {"type": "STRING"},
-                                            "awarded_marks": {"type": "NUMBER"},
-                                            "is_correct": {"type": "BOOLEAN"},
-                                            "comment": {"type": "STRING"}
-                                        },
-                                        "required": ["y_position_percent", "question_ref", "awarded_marks", "is_correct", "comment"]
-                                    }
-                                }
-                            },
-                            "required": ["page_index", "page_score", "annotations"]
-                        }
-                    }
-                },
-                "required": ["pages"]
-            },
             "temperature": 0.1,
             "maxOutputTokens": 8192
         }
@@ -124,29 +115,38 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
 
     results = {}
     success = False
+    last_error = ""
 
     for attempt in range(1, 4):
-        gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
+        gen_res = requests.post(target_url, json=payload, timeout=(15, 150))
+        
         if gen_res.status_code == 200:
-            raw_text = gen_res.json()["candidates"][0]["content"]["parts"][0]["text"]
             try:
-                parsed_data = json.loads(clean_json(raw_text))
+                res_json = gen_res.json()
+                candidates = res_json.get("candidates", [])
+                if not candidates:
+                    raise RuntimeError("API returned 200 but candidate list is empty.")
+                
+                raw_text = candidates[0]["content"]["parts"][0]["text"]
+                parsed_data = extract_and_parse_json(raw_text)
+                
                 pages_list = parsed_data.get("pages", [])
                 results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
                 success = True
                 break
-            except json.JSONDecodeError:
+            except Exception as parse_err:
+                last_error = f"Parse error on attempt {attempt}: {str(parse_err)}"
                 if attempt < 3:
                     time.sleep(attempt * 2)
                     continue
-                raise RuntimeError("Failed to decode model JSON output.")
         elif gen_res.status_code in (503, 429):
+            last_error = f"Google busy ({gen_res.status_code})"
             time.sleep(attempt * 3)
         else:
-            raise RuntimeError(f"API Call Failed ({gen_res.status_code}): {gen_res.text}")
+            raise RuntimeError(f"API failed ({gen_res.status_code}): {gen_res.text}")
 
     if not success:
-        raise RuntimeError("Inference unsuccessful after 3 attempts.")
+        raise RuntimeError(f"Failed to grade document. Details: {last_error}")
 
     total_exam_score = 0
     is_1_indexed = (0 not in results) and (1 in results)
@@ -163,7 +163,7 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
         max_marks = page_data.get("max_page_marks", "")
         total_exam_score += int(score) if str(score).isdigit() else 0
 
-        # Page Score Badge
+        # Score badge
         badge_w = 175.0 * scale
         badge_h = 28.0 * scale
         badge_margin = 12.0 * scale
@@ -187,9 +187,10 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
 
         def get_y_percent(ann):
             if "y_position_percent" in ann:
-                return float(ann["y_position_percent"])
-            if "box_2d" in ann and isinstance(ann["box_2d"], list) and len(ann["box_2d"]) == 4:
-                return float(ann["box_2d"][0]) / 10.0
+                try:
+                    return float(ann["y_position_percent"])
+                except (ValueError, TypeError):
+                    pass
             return 30.0
 
         annotations.sort(key=get_y_percent)
@@ -219,7 +220,6 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
 
             target_y = (get_y_percent(item) / 100.0) * h
 
-            # Direct line alignment with collision nudge
             if target_y < last_y_bottom:
                 actual_y0 = last_y_bottom + (3.0 * scale)
             else:
@@ -265,7 +265,6 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
     out_bytes = doc.write()
     doc.close()
     return total_exam_score, out_bytes
-
 # -------------------------------------------------------------
 # APPLICATION UI
 # -------------------------------------------------------------
@@ -310,6 +309,7 @@ if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)
 
     zip_buffer = io.BytesIO()
     summary_scores = []
+    success_count = 0
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for idx, student_file in enumerate(uploaded_students):
@@ -319,18 +319,22 @@ if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)
                 out_name = f"Graded_{student_file.name}"
                 zip_file.writestr(out_name, graded_bytes)
                 summary_scores.append({"Student File": student_file.name, "Score": f"{score}/40", "Status": "Success"})
+                success_count += 1
             except Exception as e:
-                summary_scores.append({"Student File": student_file.name, "Score": "N/A", "Status": f"Failed: {e}"})
+                summary_scores.append({"Student File": student_file.name, "Score": "N/A", "Status": f"Failed: {str(e)}"})
 
             progress_bar.progress((idx + 1) / len(uploaded_students))
 
-    status_text.text("Batch grading complete!")
+    status_text.text("Batch processing complete!")
     st.table(summary_scores)
 
-    zip_buffer.seek(0)
-    st.download_button(
-        label="📦 Download All Graded Papers (.ZIP)",
-        data=zip_buffer,
-        file_name="Graded_Submissions.zip",
-        mime="application/zip"
-    )
+    if success_count > 0:
+        zip_buffer.seek(0)
+        st.download_button(
+            label=f"📦 Download Graded Papers ({success_count} Papers in .ZIP)",
+            data=zip_buffer,
+            file_name="Graded_Submissions.zip",
+            mime="application/zip"
+        )
+    else:
+        st.error("No papers were successfully graded. Check the error messages in the table above.")
