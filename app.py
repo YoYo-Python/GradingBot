@@ -11,7 +11,7 @@ import tempfile
 # -------------------------------------------------------------
 API_KEY = "AQ.Ab8RN6JcLAADySNQqxyJ2KYgXiKIivvOYCPzmMYU55RWsPRD_A"
 MS_FILE_URI = "https://generativelanguage.googleapis.com/v1beta/files/c8opgi09eyjm"
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.6-flash"
 GENERATE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
 UPLOAD_URL = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={API_KEY}"
 
@@ -98,20 +98,39 @@ if uploaded_file and st.button("Start Grading", type="primary"):
             "X-Goog-Upload-Header-Content-Type": "application/pdf",
             "Content-Type": "application/json"
         }
+        
         init = requests.post(
-            UPLOAD_URL,
+            upload_url,
             headers=headers,
             json={"file": {"display_name": "student_paper_upload"}},
             timeout=(10, 30)
         )
+        
+        if init.status_code != 200:
+            st.error(f"Failed to initiate PDF upload to Gemini API ({init.status_code}): {init.text}")
+            st.stop()
+
         session_url = init.headers.get("X-Goog-Upload-URL")
+        if not session_url:
+            st.error(f"Google API did not return an upload session URL. Response: {init.text}")
+            st.stop()
+
         upload_headers = {
             "Content-Length": data_len,
             "X-Goog-Upload-Offset": "0",
             "X-Goog-Upload-Command": "upload, finalize"
         }
+        
         res = requests.post(session_url, headers=upload_headers, data=pdf_bytes, timeout=(10, 60))
-        file_info = res.json()["file"]
+        if res.status_code != 200:
+            st.error(f"Failed to finalize PDF upload ({res.status_code}): {res.text}")
+            st.stop()
+
+        file_info = res.json().get("file")
+        if not file_info or "uri" not in file_info:
+            st.error(f"Invalid file response from Gemini API: {res.text}")
+            st.stop()
+
         student_uri = file_info["uri"]
         student_file_name = file_info["name"]
 
