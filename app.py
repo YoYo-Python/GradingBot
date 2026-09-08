@@ -15,7 +15,7 @@ if not API_KEY:
         st.warning("Please configure your GEMINI_API_KEY in Streamlit Secrets or enter it in the sidebar.")
         st.stop()
 MS_FILE_URI = "https://generativelanguage.googleapis.com/v1beta/files/64yo2okv35nq"
-MODEL = "gemini-3.8-flash"
+MODEL = "gemini-1.5-flash"
 
 GENERATE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
 UPLOAD_URL = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={API_KEY}"
