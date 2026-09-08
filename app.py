@@ -12,7 +12,7 @@ import zipfile
 # CONFIGURATION & SECRETS
 # -------------------------------------------------------------
 API_KEY = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-MODEL = "gemini-3.8-flash"
+MODEL = "gemini-2.5-flash"
 
 if not API_KEY:
     API_KEY = str(st.sidebar.text_input("Enter Gemini API Key", type="password")).strip()
@@ -120,7 +120,7 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
     last_error = ""
 
     for attempt in range(1, 4):
-        gen_res = requests.post(target_url, json=payload, timeout=(15, 150))
+        gen_res = requests.post(target_url, json=payload, timeout=(15, 45))
         
         if gen_res.status_code == 200:
             try:
@@ -144,11 +144,11 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
         # Inside grade_single_pdf retry loop
         elif gen_res.status_code == 429:
             # 429 is a Rate/Quota limit - needs a longer wait to clear the minute window
-            wait_time = 25 * attempt  # 25s, 50s, 75s
+            wait_time = 10 * attempt  # 25s, 50s, 75s
             last_error = f"Rate limit reached (429). Waiting {wait_time}s for token bucket to reset..."
             time.sleep(wait_time)
         elif gen_res.status_code == 503:
-            wait_time = 5 * attempt
+            wait_time = 10 * attempt
             last_error = f"Google server busy (503). Waiting {wait_time}s..."
             time.sleep(wait_time)
         else:
@@ -337,7 +337,7 @@ if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)
             # Wait 10-15 seconds between papers to prevent exhausting the TPM quota
             if idx < len(uploaded_students) - 1:
                 status_text.text(f"Waiting 12s before starting next paper to clear API quota...")
-                time.sleep(12)
+                time.sleep(2)
 
     status_text.text("Batch processing complete!")
     st.table(summary_scores)
