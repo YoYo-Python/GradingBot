@@ -186,8 +186,11 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
         clean_model = str(MODEL).strip()
         clean_api_key = str(API_KEY).strip()
 
-        target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_api_key}"
-
+        target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_key}"
+        
+        # --- INITIALIZE BEFORE LOOP ---
+        results = {}
+        success = False
 
         for attempt in range(1, 4):
             gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
