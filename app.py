@@ -91,97 +91,91 @@ def extract_and_parse_json(raw_text: str) -> dict:
         cleaned = re.sub(r",\s*([\]}])", r"\1", text_to_parse)
         obj, _ = decoder.raw_decode(cleaned)
         return obj
+PAGE_GRADING_PROMPT = """
+You are a Cambridge IGCSE Chemistry (0620 Paper 6) examiner.
+Evaluate this student answer page against the provided Mark Scheme.
+
+RULES:
+- If an answer area is completely blank, award [0] and comment: "Unattempted".
+- Ignore pre-existing red ticks/notes; evaluate only blue/black handwriting.
+- If "doubt" is written, award [0] with a brief explanation from the mark scheme.
+- Award marks strictly according to Cambridge marking points (M1, A1, B1, etc.).
+- Account for Error Carried Forward (ECF) where applicable.
+- 'y_position_percent' MUST be the exact vertical coordinate (0 to 100) where the student wrote their response for that question.
+
+Return strictly valid JSON:
+{
+  "page_score": 3,
+  "max_page_marks": 5,
+  "annotations": [
+    {
+      "y_position_percent": 42.5,
+      "question_ref": "2(a)",
+      "awarded_marks": 1,
+      "is_correct": true,
+      "comment": "M1: Correct observation recorded."
+    }
+  ]
+}
+"""
+
 def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
-    student_b64 = base64.b64encode(student_bytes).decode("utf-8")
     doc = pymupdf.open(stream=student_bytes, filetype="pdf")
     total_pages = len(doc)
-
-    payload = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": "application/pdf", "data": ms_b64}},
-                {"inline_data": {"mime_type": "application/pdf", "data": student_b64}},
-                {"text": GRADING_PROMPT}
-            ]
-        }],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.1,
-            "maxOutputTokens": 8192
-        }
-    }
+    total_exam_score = 0
 
     clean_model = str(MODEL).strip()
     clean_key = str(API_KEY).strip()
     target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_key}"
-
-    results = {}
-    success = False
-    last_error = ""
-
-    for attempt in range(1, 4):
-        gen_res = requests.post(target_url, json=payload, timeout=(15, 45))
-        
-        if gen_res.status_code == 200:
-            try:
-                res_json = gen_res.json()
-                candidates = res_json.get("candidates", [])
-                if not candidates:
-                    raise RuntimeError("API returned 200 but candidate list is empty.")
-                
-                raw_text = candidates[0]["content"]["parts"][0]["text"]
-                parsed_data = extract_and_parse_json(raw_text)
-                
-                pages_list = parsed_data.get("pages", [])
-                results = {p.get("page_index", idx): p for idx, p in enumerate(pages_list)}
-                success = True
-                break
-            except Exception as parse_err:
-                last_error = f"Parse error on attempt {attempt}: {str(parse_err)}"
-                if attempt < 3:
-                    time.sleep(attempt * 2)
-                    continue
-        # Inside grade_single_pdf retry loop
-        elif gen_res.status_code == 429:
-            # 429 is a Rate/Quota limit - needs a longer wait to clear the minute window
-            wait_time = 10 * attempt  # 25s, 50s, 75s
-            last_error = f"Rate limit reached (429). Waiting {wait_time}s for token bucket to reset..."
-            time.sleep(wait_time)
-        elif gen_res.status_code == 503:
-            wait_time = 10 * attempt
-            last_error = f"Google server busy (503). Waiting {wait_time}s..."
-            time.sleep(wait_time)
-        else:
-            raise RuntimeError(f"API failed ({gen_res.status_code}): {gen_res.text}")
-
-    if not success:
-        raise RuntimeError(f"Failed to grade document. Details: {last_error}")
-
-    total_exam_score = 0
-    is_1_indexed = (0 not in results) and (1 in results)
 
     for i in range(total_pages):
         page = doc[i]
         w, h = page.rect.width, page.rect.height
         scale = max(1.0, w / 595.0)
 
-        lookup_key = (i + 1) if is_1_indexed else i
-        page_data = results.get(lookup_key, {"page_score": 0, "annotations": []})
+        # Render only the current single page as a lightweight image
+        pix = page.get_pixmap(dpi=130)
+        img_bytes = pix.tobytes("jpeg")
+        single_page_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": "application/pdf", "data": ms_b64}},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": single_page_b64}},
+                    {"text": f"{PAGE_GRADING_PROMPT}\nEvaluating page {i + 1} of {total_pages}."}
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1,
+                "maxOutputTokens": 2048
+            }
+        }
+
+        # Quick call per page: 25s timeout is plenty for 1 image
+        page_data = {"page_score": 0, "max_page_marks": 0, "annotations": []}
+        for attempt in range(1, 3):
+            try:
+                res = requests.post(target_url, json=payload, timeout=(10, 60))
+                if res.status_code == 200:
+                    raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    page_data = extract_and_parse_json(raw_text)
+                    break
+                elif res.status_code in (429, 503):
+                    time.sleep(attempt * 4)
+            except Exception:
+                if attempt == 2:
+                    break
+                time.sleep(2)
 
         score = page_data.get("page_score", 0)
         max_marks = page_data.get("max_page_marks", "")
         total_exam_score += int(score) if str(score).isdigit() else 0
 
-        # Score badge
-        badge_w = 175.0 * scale
-        badge_h = 28.0 * scale
-        badge_margin = 12.0 * scale
-        badge_rect = pymupdf.Rect(
-            w - badge_w - badge_margin,
-            badge_margin,
-            w - badge_margin,
-            badge_margin + badge_h
-        )
+        # Score badge top right
+        badge_w, badge_h, badge_margin = 175.0 * scale, 28.0 * scale, 12.0 * scale
+        badge_rect = pymupdf.Rect(w - badge_w - badge_margin, badge_margin, w - badge_margin, badge_margin + badge_h)
         page.draw_rect(badge_rect, color=(0.12, 0.45, 0.85), fill=(0.94, 0.97, 1.0), width=1.2 * scale)
         page.insert_textbox(
             badge_rect,
@@ -193,16 +187,7 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
         )
 
         annotations = page_data.get("annotations", [])
-
-        def get_y_percent(ann):
-            if "y_position_percent" in ann:
-                try:
-                    return float(ann["y_position_percent"])
-                except (ValueError, TypeError):
-                    pass
-            return 30.0
-
-        annotations.sort(key=get_y_percent)
+        annotations.sort(key=lambda a: float(a.get("y_position_percent", 30.0)))
 
         margin_right = 10.0 * scale
         card_width = max(200.0 * scale, w * 0.32)
@@ -210,14 +195,13 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
         x0 = max(10.0 * scale, x1 - card_width)
         base_font = 8.0 * scale
         usable_text_width = (x1 - x0) - (10.0 * scale)
-
         last_y_bottom = badge_margin + badge_h + (6.0 * scale)
 
         for item in annotations:
-            is_correct = item.get("is_correct", False) or item.get("color") == "green" or "[1]" in item.get("comment", "")
+            is_correct = item.get("is_correct", False) or "[1]" in item.get("comment", "")
             q_ref = item.get("question_ref", "")
             marks = item.get("awarded_marks", 1 if is_correct else 0)
-            comment = item.get("comment", item.get("text", "")).strip()
+            comment = item.get("comment", "").strip()
 
             prefix = f"[+{marks}]" if is_correct else f"[{marks}]"
             tag = f"{q_ref} {prefix}".strip()
@@ -227,13 +211,8 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
             est_lines = max(1, int(line_len // usable_text_width) + full_text.count('\n') + 1)
             card_height = (est_lines * (base_font * 1.25)) + (8.0 * scale)
 
-            target_y = (get_y_percent(item) / 100.0) * h
-
-            if target_y < last_y_bottom:
-                actual_y0 = last_y_bottom + (3.0 * scale)
-            else:
-                actual_y0 = target_y
-
+            target_y = (float(item.get("y_position_percent", 30.0)) / 100.0) * h
+            actual_y0 = last_y_bottom + (3.0 * scale) if target_y < last_y_bottom else target_y
             actual_y1 = actual_y0 + card_height
 
             if actual_y1 > h - (10.0 * scale):
@@ -246,28 +225,12 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
             text_color = (0.05, 0.40, 0.05) if is_correct else (0.75, 0.05, 0.05)
 
             page.draw_rect(rect, color=stroke_color, fill=fill_color, width=0.8 * scale)
-
-            pad_x = 4.0 * scale
-            pad_y = 3.0 * scale
+            pad_x, pad_y = 4.0 * scale, 3.0 * scale
             text_rect = pymupdf.Rect(rect.x0 + pad_x, rect.y0 + pad_y, rect.x1 - pad_x, rect.y1 - pad_y)
 
-            rc = page.insert_textbox(
-                text_rect,
-                full_text,
-                fontsize=base_font,
-                fontname="helv",
-                color=text_color,
-                align=pymupdf.TEXT_ALIGN_LEFT
-            )
+            rc = page.insert_textbox(text_rect, full_text, fontsize=base_font, fontname="helv", color=text_color, align=pymupdf.TEXT_ALIGN_LEFT)
             if rc < 0:
-                page.insert_textbox(
-                    text_rect,
-                    full_text,
-                    fontsize=base_font * 0.85,
-                    fontname="helv",
-                    color=text_color,
-                    align=pymupdf.TEXT_ALIGN_LEFT
-                )
+                page.insert_textbox(text_rect, full_text, fontsize=base_font * 0.85, fontname="helv", color=text_color, align=pymupdf.TEXT_ALIGN_LEFT)
 
             last_y_bottom = actual_y1
 
