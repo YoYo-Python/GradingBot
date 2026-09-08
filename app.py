@@ -67,28 +67,30 @@ def sanitize_text(text: str) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 def extract_and_parse_json(raw_text: str) -> dict:
-    """Safely extracts and parses JSON even if wrapped in markdown fences or trailing thoughts."""
+    """Parses the primary JSON structure and safely discards trailing text/objects."""
     text = raw_text.strip()
     
-    # 1. Strip markdown fences if present
+    # Strip Markdown fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
     
-    # 2. Find the outermost JSON object bounds
+    # Find the opening brace of the JSON payload
     start_idx = text.find("{")
-    end_idx = text.rfind("}")
+    if start_idx == -1:
+        raise ValueError("No JSON object found in response.")
+        
+    text_to_parse = text[start_idx:]
+    decoder = json.JSONDecoder()
     
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        candidate = text[start_idx:end_idx + 1]
-    else:
-        candidate = text
-
     try:
-        return json.loads(candidate)
+        # raw_decode parses up to the exact end of the first valid JSON object
+        obj, _ = decoder.raw_decode(text_to_parse)
+        return obj
     except json.JSONDecodeError:
-        # Fallback: clean trailing commas before closing braces/brackets
-        fixed = re.sub(r",\s*([\]}])", r"\1", candidate)
-        return json.loads(fixed)
+        # Secondary fallback: sanitize unescaped newlines or trailing commas
+        cleaned = re.sub(r",\s*([\]}])", r"\1", text_to_parse)
+        obj, _ = decoder.raw_decode(cleaned)
+        return obj
 def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
     student_b64 = base64.b64encode(student_bytes).decode("utf-8")
     doc = pymupdf.open(stream=student_bytes, filetype="pdf")
@@ -139,9 +141,11 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
                 if attempt < 3:
                     time.sleep(attempt * 2)
                     continue
+        # Inside grade_single_pdf retry loop
         elif gen_res.status_code in (503, 429):
-            last_error = f"Google busy ({gen_res.status_code})"
-            time.sleep(attempt * 3)
+            wait_time = attempt * 5  # Increased backoff: 5s, 10s, 15s
+            last_error = f"Google busy ({gen_res.status_code}). Waiting {wait_time}s..."
+            time.sleep(wait_time)
         else:
             raise RuntimeError(f"API failed ({gen_res.status_code}): {gen_res.text}")
 
