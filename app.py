@@ -326,7 +326,7 @@ if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)
                 success_count += 1
             except Exception as e:
                 summary_scores.append({"Student File": student_file.name, "Score": "N/A", "Status": f"Failed: {str(e)}"})
-
+                time.sleep(2)
             progress_bar.progress((idx + 1) / len(uploaded_students))
 
     status_text.text("Batch processing complete!")
