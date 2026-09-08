@@ -8,8 +8,13 @@ import os
 # -------------------------------------------------------------
 # CONFIGURATION & SECRETS
 # -------------------------------------------------------------
-API_KEY = st.secrets.get("GEMINI_API_KEY", "AQ.Ab8RN6JcLAADySNQqxyJ2KYgXiKIivvOYCPzmMYU55RWsPRD_A")
-MS_FILE_URI = "https://generativelanguage.googleapis.com/v1beta/files/c8opgi09eyjm"
+API_KEY = st.secrets.get("GEMINI_API_KEY")
+if not API_KEY:
+    API_KEY = st.sidebar.text_input("Enter Gemini API Key", type="password")
+    if not API_KEY:
+        st.warning("Please configure your GEMINI_API_KEY in Streamlit Secrets or enter it in the sidebar.")
+        st.stop()
+MS_FILE_URI = "https://generativelanguage.googleapis.com/v1beta/files/64yo2okv35nq"
 MODEL = "gemini-3.6-flash"
 
 GENERATE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
