@@ -10,7 +10,7 @@ import time
 # CONFIGURATION & SECRETS
 # -------------------------------------------------------------
 API_KEY = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-MODEL = "gemini-3-flash"
+MODEL = "gemini-3.0-flash"
 
 if not API_KEY:
     API_KEY = str(st.sidebar.text_input("Enter Gemini API Key", type="password")).strip()
