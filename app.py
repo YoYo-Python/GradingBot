@@ -145,10 +145,12 @@ if uploaded_student and st.button("Grade Paper", type="primary"):
                 "maxOutputTokens": 8192
             }
         }
+        # Clean model and key strings to prevent whitespace/newline issues
+        clean_model = str(MODEL).strip()
+        clean_api_key = str(API_KEY).strip()
 
-        target_url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){MODEL}:generateContent?key={API_KEY}"
-        results = {}
-        success = False
+        target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={clean_api_key}"
+
 
         for attempt in range(1, 4):
             gen_res = requests.post(target_url, json=payload, timeout=(10, 120))
