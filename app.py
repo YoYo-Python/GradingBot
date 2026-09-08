@@ -142,9 +142,14 @@ def grade_single_pdf(student_bytes: bytes, ms_b64: str) -> tuple[int, bytes]:
                     time.sleep(attempt * 2)
                     continue
         # Inside grade_single_pdf retry loop
-        elif gen_res.status_code in (503, 429):
-            wait_time = attempt * 5  # Increased backoff: 5s, 10s, 15s
-            last_error = f"Google busy ({gen_res.status_code}). Waiting {wait_time}s..."
+        elif gen_res.status_code == 429:
+            # 429 is a Rate/Quota limit - needs a longer wait to clear the minute window
+            wait_time = 25 * attempt  # 25s, 50s, 75s
+            last_error = f"Rate limit reached (429). Waiting {wait_time}s for token bucket to reset..."
+            time.sleep(wait_time)
+        elif gen_res.status_code == 503:
+            wait_time = 5 * attempt
+            last_error = f"Google server busy (503). Waiting {wait_time}s..."
             time.sleep(wait_time)
         else:
             raise RuntimeError(f"API failed ({gen_res.status_code}): {gen_res.text}")
@@ -326,8 +331,13 @@ if uploaded_students and st.button(f"Grade All ({len(uploaded_students)} Papers)
                 success_count += 1
             except Exception as e:
                 summary_scores.append({"Student File": student_file.name, "Score": "N/A", "Status": f"Failed: {str(e)}"})
-                time.sleep(2)
+
             progress_bar.progress((idx + 1) / len(uploaded_students))
+            
+            # Wait 10-15 seconds between papers to prevent exhausting the TPM quota
+            if idx < len(uploaded_students) - 1:
+                status_text.text(f"Waiting 12s before starting next paper to clear API quota...")
+                time.sleep(12)
 
     status_text.text("Batch processing complete!")
     st.table(summary_scores)
