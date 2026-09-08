@@ -18,7 +18,7 @@ if not API_KEY:
         st.stop()
 
 client = genai.Client(api_key=API_KEY)
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.7-flash"
 
 # -------------------------------------------------------------
 # STRUCTURED OUTPUT SCHEMA (PYDANTIC)
